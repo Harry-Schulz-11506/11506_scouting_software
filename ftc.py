@@ -1,156 +1,150 @@
 """
-FTC DECODE Scouting System V8.0 - Complete Server Edition (clean, API-field names)
-- Restores full UI
-- Uses FTC API scoring field names where available (autoPoints, dcPoints, endgamePoints, penaltyPointsCommitted, totalPoints)
-- Removes 'Lift up over base' / lift_over_base completely
+FTC DECODE Scouting System by 11506
+Complete server with integrated UI - FIXED NAVIGATION
+Run: python app.py
 """
 import json
 import os
 import numpy as np
 import requests
 import base64
-from flask import Flask, render_template_string, jsonify, request
-
-# ============================================================================
-# FLASK APP INITIALIZATION
-# ============================================================================
+from datetime import datetime
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
+import warnings
+warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
+CORS(app)
+app.config['SECRET_KEY'] = os.urandom(24)
 
-# FTC API Configuration (can override via env vars)
+# API Config
 FTC_API_BASE = 'https://ftc-api.firstinspires.org/v2.0'
 FTC_API_USERNAME = os.environ.get('FTC_API_USERNAME', 'harry')
 FTC_API_KEY = os.environ.get('FTC_API_KEY', '4B5F8571-EB4C-4F87-9DC1-0F3C5AFAF010')
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+# Neural Network
+class FTCNeuralNetwork:
+    def __init__(self):
+        self.model = MLPRegressor(hidden_layer_sizes=(32, 16), activation='relu', solver='adam', max_iter=500, early_stopping=True, validation_fraction=0.2, random_state=42)
+        self.scaler = StandardScaler()
+        self.is_trained = False
+        self.training_samples = 0
+    
+    def extract_features(self, t1, t2):
+        t1_e = t1.get('entries', [])
+        t2_e = t2.get('entries', [])
+        return np.array([
+            np.mean([e.get('autoPoints', 0) for e in t1_e]) if t1_e else 0,
+            np.std([e.get('autoPoints', 0) for e in t1_e]) if len(t1_e) > 1 else 0,
+            np.mean([e.get('dcPoints', 0) for e in t1_e]) if t1_e else 0,
+            np.std([e.get('dcPoints', 0) for e in t1_e]) if len(t1_e) > 1 else 0,
+            np.mean([e.get('endgamePoints', 0) for e in t1_e]) if t1_e else 0,
+            np.std([e.get('endgamePoints', 0) for e in t1_e]) if len(t1_e) > 1 else 0,
+            np.mean([e.get('totalPoints', 0) for e in t1_e]) if t1_e else 0,
+            sum([e.get('penaltyPointsCommitted', 0) for e in t1_e]),
+            np.mean([e.get('autoPoints', 0) for e in t2_e]) if t2_e else 0,
+            np.std([e.get('autoPoints', 0) for e in t2_e]) if len(t2_e) > 1 else 0,
+            np.mean([e.get('dcPoints', 0) for e in t2_e]) if t2_e else 0,
+            np.std([e.get('dcPoints', 0) for e in t2_e]) if len(t2_e) > 1 else 0,
+            np.mean([e.get('endgamePoints', 0) for e in t2_e]) if t2_e else 0,
+            np.std([e.get('endgamePoints', 0) for e in t2_e]) if len(t2_e) > 1 else 0,
+            np.mean([e.get('totalPoints', 0) for e in t2_e]) if t2_e else 0,
+            sum([e.get('penaltyPointsCommitted', 0) for e in t2_e])
+        ]).reshape(1, -1)
+    
+    def train(self, teams_dict, matches):
+        if len(teams_dict) < 4:
+            return False
+        X_train, y_train = [], []
+        for match in matches:
+            red_teams = []
+            blue_teams = []
+            if 'teams' in match:
+                for te in match.get('teams', []):
+                    tn = str(te.get('teamNumber', ''))
+                    st = te.get('station', '')
+                    if tn in teams_dict:
+                        if 'Red' in st:
+                            red_teams.append(tn)
+                        else:
+                            blue_teams.append(tn)
+            if len(red_teams) >= 2:
+                score = match.get('scoreRedFinal', 0) or match.get('scoreRed', 0)
+                if score > 0:
+                    features = self.extract_features(teams_dict[red_teams[0]], teams_dict[red_teams[1]])
+                    X_train.append(features[0])
+                    blue_score = match.get('scoreBlueFinal', 0) or match.get('scoreBlue', 0)
+                    y_train.append([score, 1.0 if score > blue_score else 0.0])
+            if len(blue_teams) >= 2:
+                score = match.get('scoreBlueFinal', 0) or match.get('scoreBlue', 0)
+                if score > 0:
+                    features = self.extract_features(teams_dict[blue_teams[0]], teams_dict[blue_teams[1]])
+                    X_train.append(features[0])
+                    red_score = match.get('scoreRedFinal', 0) or match.get('scoreRed', 0)
+                    y_train.append([score, 1.0 if score > red_score else 0.0])
+        if len(X_train) < 5:
+            return False
+        X_train = np.array(X_train)
+        y_train = np.array(y_train)
+        X_scaled = self.scaler.fit_transform(X_train)
+        self.model.fit(X_scaled, y_train)
+        self.is_trained = True
+        self.training_samples = len(X_train)
+        return True
+    
+    def predict(self, t1, t2):
+        if not self.is_trained:
+            return None
+        features = self.extract_features(t1, t2)
+        features_scaled = self.scaler.transform(features)
+        prediction = self.model.predict(features_scaled)[0]
+        return {'expected_score': float(max(0, prediction[0])), 'win_probability': float(min(max(prediction[1] * 100, 0), 100))}
 
-def load_config():
-    config_path = 'config.json'
-    default_config = {
-        "scoring_weights": {
-            "auto_weight": 0.3,
-            "teleop_weight": 0.5,
-            "endgame_weight": 0.2,
-            "hanging_success_weight": 0.2,
-            "reliability_multiplier": 3,
-            "cycle_time_factor": 50
-        },
-        "thresholds": {
-            "strong_auto": 20,
-            "fast_cycle": 12,
-            "high_hanging": 80,
-            "high_reliability": 4,
-            "high_scoring": 100,
-            "consistency_high": 70,
-            "consistency_medium": 40
-        },
-        "alliance": {
-            "min_combined_score": 120,
-            "consistency_threshold": 70
-        }
-    }
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return default_config
-    else:
-        with open(config_path, 'w') as f:
-            json.dump(default_config, f, indent=4)
-        return default_config
+AI_MODEL = FTCNeuralNetwork()
 
-CONFIG = load_config()
-
-# In-memory event store
-EVENT_STORE = {
-    'event_code': None,
-    'season': 2025,
-    'team_number': None,
-    'raw_matches': [],
-    'processed_entries': {},
-    'teams_processed': {}
+CONFIG = {
+    "thresholds": {"strong_auto": 20, "high_scoring": 100},
 }
 
-# ============================================================================
-# UTILS
-# ============================================================================
-
-def safe_int(v, d=0):
-    try:
-        if isinstance(v, str):
-            v = v.strip()
-            if v.lower() in ['yes', 'true', 'complete']:
-                return 1
-            if v.lower() in ['no', 'false', 'failed']:
-                return 0
-        return int(float(v))
-    except:
-        return d
-
-def safe_float(v, d=0.0):
-    try:
-        return float(v)
-    except:
-        return d
+EVENT_STORE = {'event_code': None, 'season': 2025, 'team_number': None, 'raw_matches': [], 'teams_processed': {}}
 
 def get_ftc_api_headers():
     if not FTC_API_USERNAME or not FTC_API_KEY:
         return None
-    auth_string = f"{FTC_API_USERNAME}:{FTC_API_KEY}"
-    b64 = base64.b64encode(auth_string.encode('ascii')).decode('ascii')
+    auth = f"{FTC_API_USERNAME}:{FTC_API_KEY}"
+    b64 = base64.b64encode(auth.encode('ascii')).decode('ascii')
     return {'Authorization': f'Basic {b64}', 'Accept': 'application/json'}
 
-# ============================================================================
-# FETCH MATCHES
-# ============================================================================
 def fetch_event_matches(event_code, season=2025):
-    """Fetch matches from the FTC API. Returns list or None."""
     headers = get_ftc_api_headers()
+    if not headers:
+        return None
     try:
         url = f"{FTC_API_BASE}/{season}/matches/{event_code}"
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
-        data = resp.json()
-        return data.get('matches', [])
-    except Exception as e:
-        print(f"Error fetching matches: {e}")
+        return resp.json().get('matches', [])
+    except:
         return None
 
-# ============================================================================
-# PROCESS MATCH DATA (uses API field names where possible)
-# ============================================================================
 def process_ftc_match_data(matches):
-    """
-    Convert FTC API match data into per-team entry records.
-    Each entry includes both 'friendly' fields and the API's field names:
-      - autoPoints, dcPoints, endgamePoints, penaltyPointsCommitted, totalPoints
-    'Lift up over base' removed entirely.
-    """
     teams = {}
     for match_idx, match in enumerate(matches):
-        match_num = match.get('matchNumber', match_idx + 1)
-        actual_start = match.get('actualStartTime')
-        post_result_time = match.get('postResultTime')
-        if not actual_start and not post_result_time:
-            # skip unplayed
+        if not isinstance(match, dict):
             continue
-
-        # Priority 1: match-level teams array (modern API)
+        match_num = match.get('matchNumber', match_idx + 1)
+        if not match.get('actualStartTime') and not match.get('postResultTime'):
+            continue
         if 'teams' in match and isinstance(match['teams'], list):
-            # try to get common score fields at match level (fallback to various names)
             score_red = match.get('scoreRedFinal') or match.get('scoreRed') or 0
             score_blue = match.get('scoreBlueFinal') or match.get('scoreBlue') or 0
             auto_red = match.get('scoreRedAuto') or 0
             auto_blue = match.get('scoreBlueAuto') or 0
-            foul_red = match.get('scoreRedFoul') or 0
-            foul_blue = match.get('scoreBlueFoul') or 0
-
             for team_entry in match['teams']:
                 if not isinstance(team_entry, dict):
                     continue
@@ -158,311 +152,111 @@ def process_ftc_match_data(matches):
                 station = team_entry.get('station', '') or ''
                 if not team_num or team_num == '0':
                     continue
-
-                # determine alliance by station string
                 if 'Red' in station or 'red' in station.lower():
                     total_points = score_red or 0
                     auto_points = auto_red or 0
-                    penalty_points = foul_red or 0
                 else:
                     total_points = score_blue or 0
                     auto_points = auto_blue or 0
-                    penalty_points = foul_blue or 0
-
                 remaining = total_points - auto_points
                 teleop_points = int(remaining * 0.70)
                 endgame_points = remaining - teleop_points
-
-                # Build entry with API-style field names plus friendly keys
-                entry = {
-                    # API-style fields
-                    'autoPoints': auto_points,
-                    'dcPoints': teleop_points,
-                    'endgamePoints': endgame_points,
-                    'penaltyPointsCommitted': penalty_points,
-                    'totalPoints': total_points,
-
-                    # Friendly / backward-compatible keys used elsewhere in code
-                    'Auto Score': auto_points,
-                    'Teleop Score': teleop_points,
-                    'Endgame Score': endgame_points,
-                    'Penalties': penalty_points // 2,
-                    'Total Score': total_points,
-
-                    'Team Number': team_num,
-                    'Match Number': match_num,
-                    'Cycle Time': 15,
-                    'Hanging Success': 75 if endgame_points > 8 else 0,
-                    'Reliability': 4 if auto_points > 15 else 3
-                }
-
+                entry = {'autoPoints': auto_points, 'dcPoints': teleop_points, 'endgamePoints': endgame_points, 'penaltyPointsCommitted': 0, 'totalPoints': total_points, 'Team Number': team_num, 'Match Number': match_num}
                 teams.setdefault(team_num, []).append(entry)
-            continue
-
-        # Priority 2: alliance-based structure (older variation)
-        for color in ['red', 'blue']:
-            alliance = match.get(f'{color}Alliance') or match.get(color)
-            if not alliance or not isinstance(alliance, dict):
-                continue
-
-            # Extract teams
-            team_list = []
-            if 'teams' in alliance and isinstance(alliance['teams'], list):
-                for t in alliance['teams']:
-                    if isinstance(t, dict):
-                        tn = t.get('teamNumber')
-                        if tn:
-                            team_list.append(str(tn))
-                    elif t:
-                        team_list.append(str(t))
-            else:
-                for i in range(1, 4):
-                    tn = alliance.get(f'team{i}')
-                    if tn and tn != 0:
-                        team_list.append(str(tn))
-
-            if not team_list:
-                continue
-
-            # Prefer API field names where present
-            total_points = alliance.get('totalPoints') or alliance.get('score') or 0
-            auto_total = alliance.get('autoPoints', 0) or 0
-            dc_points = alliance.get('dcPoints', 0) or 0
-            endgame_points = alliance.get('endgamePoints', 0) or 0
-            penalties = alliance.get('penaltyPointsCommitted', 0) or 0
-
-            # If detailed breakdown missing, estimate
-            if auto_total == 0 and dc_points == 0 and endgame_points == 0 and total_points > 0:
-                auto_total = int(total_points * 0.25)
-                dc_points = int(total_points * 0.55)
-                endgame_points = int(total_points * 0.20)
-
-            for tn in team_list:
-                entry = {
-                    # API-style
-                    'autoPoints': auto_total,
-                    'dcPoints': dc_points,
-                    'endgamePoints': endgame_points,
-                    'penaltyPointsCommitted': penalties // max(1, len(team_list)),
-                    'totalPoints': total_points,
-
-                    # Friendly
-                    'Auto Score': auto_total,
-                    'Teleop Score': dc_points,
-                    'Endgame Score': endgame_points,
-                    'Penalties': penalties // max(1, len(team_list)),
-                    'Total Score': total_points,
-
-                    'Team Number': str(tn),
-                    'Match Number': match_num,
-                    'Cycle Time': 15,
-                    'Hanging Success': 75 if endgame_points > 8 else 0,
-                    'Reliability': 4 if auto_total > 15 else 3
-                }
-                teams.setdefault(str(tn), []).append(entry)
     return teams
 
-# ============================================================================
-# AGGREGATION & ANALYSIS (no 'lift' fields)
-# ============================================================================
 def analyze_patterns(entries):
-    """Analyze entries list and return pattern metrics."""
     if not entries:
-        return {
-            'consistency': 0, 'trend': '→', 'peak': 0,
-            'strength_areas': [], 'weakness_areas': [],
-            'behavioral': 'Unknown', 'reliability': 'Unknown'
-        }
-
-    scores = [safe_int(e.get('Total Score', 0)) for e in entries]
-    cycles = [safe_float(e.get('Cycle Time', 20)) for e in entries]
-    hanging = [safe_int(e.get('Hanging Success', 0)) for e in entries]
-    reliabilities = [safe_int(e.get('Reliability', 3)) for e in entries]
-
-    if len(scores) > 1:
-        variance = np.var(scores)
-        consistency = max(0, 100 - (variance * 10))
+        return {'consistency': 0, 'trend': '→', 'peak': 0, 'strength_areas': [], 'weakness_areas': []}
+    total_scores = [e.get('totalPoints', 0) for e in entries]
+    auto_scores = [e.get('autoPoints', 0) for e in entries]
+    teleop_scores = [e.get('dcPoints', 0) for e in entries]
+    endgame_scores = [e.get('endgamePoints', 0) for e in entries]
+    if len(total_scores) > 1:
+        std_dev = np.std(total_scores)
+        mean_score = np.mean(total_scores)
+        cv = (std_dev / mean_score * 100) if mean_score > 0 else 100
+        consistency = max(0, 100 - cv)
     else:
         consistency = 50
-
-    if len(scores) >= 3:
-        early_avg = np.mean(scores[:len(scores)//2])
-        late_avg = np.mean(scores[len(scores)//2:])
+    if len(total_scores) >= 3:
+        early_avg = np.mean(total_scores[:len(total_scores)//2])
+        late_avg = np.mean(total_scores[len(total_scores)//2:])
         trend = '↗' if late_avg > early_avg + 5 else '↘' if late_avg < early_avg - 5 else '→'
     else:
         trend = '→'
-
-    peak = max(scores) if scores else 0
+    peak = max(total_scores) if total_scores else 0
     strength_areas = []
     weakness_areas = []
-
-    thresholds = CONFIG['thresholds']
-    avg_cycle = np.mean(cycles) if cycles else 20
-    if avg_cycle <= thresholds['fast_cycle']:
-        strength_areas.append('Speed')
+    avg_auto = np.mean(auto_scores) if auto_scores else 0
+    avg_teleop = np.mean(teleop_scores) if teleop_scores else 0
+    avg_endgame = np.mean(endgame_scores) if endgame_scores else 0
+    if avg_auto >= 20:
+        strength_areas.append('Auto')
     else:
-        weakness_areas.append('Speed')
-
-    avg_hanging = np.mean(hanging) if hanging else 0
-    if avg_hanging >= thresholds['high_hanging']:
-        strength_areas.append('Climbing')
+        weakness_areas.append('Auto')
+    if avg_teleop >= 40:
+        strength_areas.append('Teleop')
     else:
-        weakness_areas.append('Climbing')
-
-    avg_reliability = np.mean(reliabilities) if reliabilities else 3
-    if avg_reliability >= thresholds['high_reliability']:
-        strength_areas.append('Reliability')
+        weakness_areas.append('Teleop')
+    if avg_endgame >= 15:
+        strength_areas.append('Endgame')
     else:
-        weakness_areas.append('Reliability')
-
-    avg_score = np.mean(scores) if scores else 0
-    if avg_score >= thresholds['high_scoring']:
-        strength_areas.append('Scoring')
-    else:
-        weakness_areas.append('Scoring')
-
-    penalties = sum(1 for e in entries if safe_int(e.get('Penalties', 0)) > 0)
-    hanging_count = sum(1 for e in entries if safe_int(e.get('Hanging Success', 0)) > 0)
-
-    if penalties > len(entries) * 0.3:
-        behavioral = 'Aggressive'
-    elif hanging_count > len(entries) * 0.5:
-        behavioral = 'Climbing-Focused'
-    elif consistency >= 75:
-        behavioral = 'Consistent'
-    else:
-        behavioral = 'Variable'
-
-    reliability = '🟢 Consistent' if consistency >= thresholds['consistency_high'] else '🟡 Moderate' if consistency >= thresholds['consistency_medium'] else '🔴 Variable'
-
-    return {
-        'consistency': round(consistency, 1),
-        'trend': trend,
-        'peak': peak,
-        'strength_areas': strength_areas,
-        'weakness_areas': weakness_areas,
-        'behavioral': behavioral,
-        'reliability': reliability
-    }
+        weakness_areas.append('Endgame')
+    return {'consistency': round(consistency, 1), 'trend': trend, 'peak': peak, 'strength_areas': strength_areas, 'weakness_areas': weakness_areas}
 
 def process_teams(raw_entries_map):
-    """
-    Accepts dict team->entries or list(entries). Returns aggregated stats per team.
-    """
     teams = {}
-    if isinstance(raw_entries_map, dict):
-        items = raw_entries_map.items()
-    else:
-        grouped = {}
-        for e in raw_entries_map:
-            tn = str(e.get('Team Number', 'Unknown')).strip()
-            if not tn or tn == 'Unknown':
-                continue
-            grouped.setdefault(tn, []).append(e)
-        items = grouped.items()
-
+    items = raw_entries_map.items() if isinstance(raw_entries_map, dict) else []
     for tn, entries in items:
         if not entries:
             continue
-        n = len(entries)
-        auto_avg = sum(safe_int(e.get('Auto Score', 0)) for e in entries) / n
-        teleop_avg = sum(safe_int(e.get('Teleop Score', 0)) for e in entries) / n
-        endgame_avg = sum(safe_int(e.get('Endgame Score', 0)) for e in entries) / n
-        total_avg = sum(safe_int(e.get('Total Score', 0)) for e in entries) / n
-        cycle_avg = sum(safe_float(e.get('Cycle Time', 20)) for e in entries) / n
-        hanging_count = sum(1 for e in entries if safe_int(e.get('Hanging Success', 0)) > 0)
-        hanging_pct = (hanging_count / n) * 100
-        reliability = sum(safe_int(e.get('Reliability', 3)) for e in entries) / n
-        penalties = sum(safe_int(e.get('Penalties', 0)) for e in entries)
-
+        auto_scores = [e.get('autoPoints', 0) for e in entries]
+        teleop_scores = [e.get('dcPoints', 0) for e in entries]
+        endgame_scores = [e.get('endgamePoints', 0) for e in entries]
+        total_scores = [e.get('totalPoints', 0) for e in entries]
         teams[str(tn)] = {
             'team_number': str(tn),
             'entries': entries,
-            'auto_score_avg': auto_avg,
-            'teleop_score_avg': teleop_avg,
-            'endgame_score_avg': endgame_avg,
-            'total_score_avg': total_avg,
-            'cycle_time': cycle_avg,
-            'hanging_success': hanging_pct,
-            'reliability': reliability,
-            'penalties': penalties,
+            'auto_score_avg': np.mean(auto_scores) if auto_scores else 0,
+            'auto_score_std': np.std(auto_scores) if len(auto_scores) > 1 else 0,
+            'teleop_score_avg': np.mean(teleop_scores) if teleop_scores else 0,
+            'teleop_score_std': np.std(teleop_scores) if len(teleop_scores) > 1 else 0,
+            'endgame_score_avg': np.mean(endgame_scores) if endgame_scores else 0,
+            'endgame_score_std': np.std(endgame_scores) if len(endgame_scores) > 1 else 0,
+            'total_score_avg': np.mean(total_scores) if total_scores else 0,
+            'total_score_std': np.std(total_scores) if len(total_scores) > 1 else 0,
+            'penalties': 0,
             'pattern_analysis': analyze_patterns(entries)
         }
     return teams
 
-# ============================================================================
-# ALLIANCE / STRATEGY / RANKING
-# ============================================================================
 def get_strengths(team):
     s = []
-    thresholds = CONFIG['thresholds']
-    if team.get('auto_score_avg', 0) >= thresholds['strong_auto']:
+    if team.get('auto_score_avg', 0) >= 20:
         s.append('Strong Auto')
-    if team.get('cycle_time', 30) <= thresholds['fast_cycle']:
-        s.append('Fast Cycles')
-    if team.get('hanging_success', 0) >= thresholds['high_hanging']:
-        s.append('Climbing')
-    if team.get('reliability', 0) >= thresholds['high_reliability']:
-        s.append('Reliable')
-    if team.get('total_score_avg', 0) >= thresholds['high_scoring']:
+    if team.get('teleop_score_avg', 0) >= 40:
+        s.append('Strong Teleop')
+    if team.get('endgame_score_avg', 0) >= 15:
+        s.append('Strong Endgame')
+    if team.get('pattern_analysis', {}).get('consistency', 0) >= 70:
+        s.append('Consistent')
+    if team.get('total_score_avg', 0) >= 100:
         s.append('High Scoring')
     return s if s else ['Developing']
 
-def calc_alliance_score(t1, t2):
+def calc_alliance_score_ai(t1, t2):
     if not t1 or not t2:
         return 0.0
-    t1_total = t1.get('total_score_avg', 0)
-    t2_total = t2.get('total_score_avg', 0)
-    combined_avg = (t1_total + t2_total) / 2
-    scoring_component = (combined_avg / 150) * 40
-
-    t1_auto = t1.get('auto_score_avg', 0)
-    t2_auto = t2.get('auto_score_avg', 0)
-    t1_teleop = t1.get('teleop_score_avg', 0)
-    t2_teleop = t2.get('teleop_score_avg', 0)
-    t1_endgame = t1.get('endgame_score_avg', 0)
-    t2_endgame = t2.get('endgame_score_avg', 0)
-
-    auto_synergy = min((t1_auto + t2_auto) / 40, 1) * 8
-    teleop_synergy = min((t1_teleop + t2_teleop) / 80, 1) * 12
-    endgame_synergy = min((t1_endgame + t2_endgame) / 30, 1) * 5
-    phase_component = auto_synergy + teleop_synergy + endgame_synergy
-
-    t1_consistency = t1.get('pattern_analysis', {}).get('consistency', 50)
-    t2_consistency = t2.get('pattern_analysis', {}).get('consistency', 50)
-    avg_consistency = (t1_consistency + t2_consistency) / 2
-    consistency_component = (avg_consistency / 100) * 20
-
-    t1_reliability = t1.get('reliability', 3) / 5
-    t2_reliability = t2.get('reliability', 3) / 5
-    avg_reliability = (t1_reliability + t2_reliability) / 2
-
-    avg_cycle = (t1.get('cycle_time', 20) + t2.get('cycle_time', 20)) / 2
-    cycle_efficiency = max(0, (20 - avg_cycle) / 15)
-
-    reliability_component = (avg_reliability * 0.6 + cycle_efficiency * 0.4) * 15
-
-    bonus = 0
-    if (t1_auto >= 20 and t2_teleop >= 40) or (t2_auto >= 20 and t1_teleop >= 40):
-        bonus += 3
-    if t1.get('hanging_success', 0) >= 70 and t2.get('hanging_success', 0) >= 70:
-        bonus += 4
-
-    t1_variance = np.std([t1_auto, t1_teleop, t1_endgame]) if any([t1_auto, t1_teleop, t1_endgame]) else 0
-    t2_variance = np.std([t2_auto, t2_teleop, t2_endgame]) if any([t2_auto, t2_teleop, t2_endgame]) else 0
-    if (t1_variance > 15 and t2_variance < 10) or (t2_variance > 15 and t1_variance < 10):
-        bonus += 3
-
-    penalty = 0
-    if t1_consistency < 50 and t2_consistency < 50:
-        penalty += 5
-    if t1_endgame < 10 and t2_endgame < 10:
-        penalty += 3
-    if t1.get('penalties', 0) > 5 and t2.get('penalties', 0) > 5:
-        penalty += 4
-
-    total_score = scoring_component + phase_component + consistency_component + reliability_component + bonus - penalty
-    return round(max(0, min(100, total_score)), 2)
+    ai_prediction = AI_MODEL.predict(t1, t2)
+    if ai_prediction:
+        expected_score = ai_prediction['expected_score']
+        win_prob = ai_prediction['win_probability']
+        score_component = min((expected_score / 150) * 60, 60)
+        win_component = (win_prob / 100) * 40
+        return round(max(0, min(100, score_component + win_component)), 2)
+    combined_avg = (t1.get('total_score_avg', 0) + t2.get('total_score_avg', 0)) / 2
+    return round(min((combined_avg / 150) * 100, 100), 2)
 
 def find_best_alliances(your_team_num, teams_dict):
     if str(your_team_num) not in teams_dict:
@@ -472,26 +266,27 @@ def find_best_alliances(your_team_num, teams_dict):
     for team_num, partner_team in teams_dict.items():
         if str(team_num) == str(your_team_num):
             continue
-        score = calc_alliance_score(your_team, partner_team)
+        score = calc_alliance_score_ai(your_team, partner_team)
+        ai_prediction = AI_MODEL.predict(your_team, partner_team)
         reasons = []
-        if (your_team.get('auto_score_avg', 0) >= 20 or partner_team.get('auto_score_avg', 0) >= 20) and (your_team.get('teleop_score_avg', 0) >= 40 or partner_team.get('teleop_score_avg', 0) >= 40):
-            reasons.append("Excellent phase distribution - strong auto and teleop coverage")
+        if ai_prediction:
+            reasons.append(f"AI predicts {ai_prediction['expected_score']:.0f} points")
+            reasons.append(f"Win probability: {ai_prediction['win_probability']:.1f}%")
         combined_score = your_team.get('total_score_avg', 0) + partner_team.get('total_score_avg', 0)
         if combined_score >= 140:
-            reasons.append(f"Outstanding combined scoring potential ({combined_score:.0f} pts)")
-        elif combined_score >= 120:
-            reasons.append(f"Strong combined scoring potential ({combined_score:.0f} pts)")
+            reasons.append(f"Outstanding combined avg ({combined_score:.0f} pts)")
         alliances.append({
             'partner_team': team_num,
             'alliance_score': score,
             'compatibility_reasons': reasons[:4],
+            'ai_expected_score': ai_prediction['expected_score'] if ai_prediction else None,
+            'ai_win_probability': ai_prediction['win_probability'] if ai_prediction else None,
             'partner_stats': {
                 'auto': partner_team.get('auto_score_avg', 0),
                 'teleop': partner_team.get('teleop_score_avg', 0),
                 'endgame': partner_team.get('endgame_score_avg', 0),
                 'total': partner_team.get('total_score_avg', 0),
-                'consistency': partner_team.get('pattern_analysis', {}).get('consistency', 50),
-                'hanging': partner_team.get('hanging_success', 0)
+                'consistency': partner_team.get('pattern_analysis', {}).get('consistency', 50)
             }
         })
     alliances.sort(key=lambda x: x['alliance_score'], reverse=True)
@@ -502,24 +297,22 @@ def generate_ai_strategy(your_team, partner_team, teams_dict):
         return {'error': 'One or both teams not scouted'}
     our = teams_dict[str(your_team)]
     partner = teams_dict[str(partner_team)]
-    score = calc_alliance_score(our, partner)
+    score = calc_alliance_score_ai(our, partner)
+    ai_prediction = AI_MODEL.predict(our, partner)
     auto_total = int(our.get('auto_score_avg', 0) + partner.get('auto_score_avg', 0))
     teleop_total = int(our.get('teleop_score_avg', 0) + partner.get('teleop_score_avg', 0))
     endgame_total = int(our.get('endgame_score_avg', 0) + partner.get('endgame_score_avg', 0))
     total = auto_total + teleop_total + endgame_total
-
     risks = []
     if our.get('pattern_analysis', {}).get('consistency', 50) < 50:
         risks.append('Your team shows high performance variability')
     if partner.get('pattern_analysis', {}).get('consistency', 50) < 50:
         risks.append('Partner team shows high performance variability')
-    if our.get('hanging_success', 0) < 50:
-        risks.append('Your team has low endgame reliability')
-    if partner.get('hanging_success', 0) < 50:
-        risks.append('Partner team has low endgame reliability')
-
     return {
         'score': score,
+        'ai_enabled': ai_prediction is not None,
+        'ai_expected_score': ai_prediction['expected_score'] if ai_prediction else None,
+        'ai_win_probability': ai_prediction['win_probability'] if ai_prediction else None,
         'team1_num': your_team,
         'team2_num': partner_team,
         'team1_strengths': get_strengths(our),
@@ -528,26 +321,6 @@ def generate_ai_strategy(your_team, partner_team, teams_dict):
         'team2_name': f"Team {partner_team}",
         'strategy_data': {
             'compatibility_score': score,
-            'your_team': {
-                'number': your_team,
-                'auto': int(our.get('auto_score_avg', 0)),
-                'teleop': int(our.get('teleop_score_avg', 0)),
-                'endgame': int(our.get('endgame_score_avg', 0)),
-                'total': int(our.get('total_score_avg', 0)),
-                'hanging': int(our.get('hanging_success', 0)),
-                'consistency': our.get('pattern_analysis', {}).get('consistency', 0),
-                'penalties': int(our.get('penalties', 0))
-            },
-            'partner_team': {
-                'number': partner_team,
-                'auto': int(partner.get('auto_score_avg', 0)),
-                'teleop': int(partner.get('teleop_score_avg', 0)),
-                'endgame': int(partner.get('endgame_score_avg', 0)),
-                'total': int(partner.get('total_score_avg', 0)),
-                'hanging': int(partner.get('hanging_success', 0)),
-                'consistency': partner.get('pattern_analysis', {}).get('consistency', 0),
-                'penalties': int(partner.get('penalties', 0))
-            },
             'auto_phase': auto_total,
             'teleop_phase': teleop_total,
             'endgame_phase': endgame_total,
@@ -563,8 +336,11 @@ def get_ranking_list(teams_dict):
             'team_number': tn,
             'score': team.get('total_score_avg', 0),
             'auto': team.get('auto_score_avg', 0),
+            'auto_std': team.get('auto_score_std', 0),
             'teleop': team.get('teleop_score_avg', 0),
+            'teleop_std': team.get('teleop_score_std', 0),
             'endgame': team.get('endgame_score_avg', 0),
+            'endgame_std': team.get('endgame_score_std', 0),
             'consistency': team.get('pattern_analysis', {}).get('consistency', 0),
             'trend': team.get('pattern_analysis', {}).get('trend', '→'),
             'strengths': get_strengths(team)
@@ -572,762 +348,352 @@ def get_ranking_list(teams_dict):
     ranked.sort(key=lambda x: x['score'], reverse=True)
     return ranked
 
-# ============================================================================
-# EMBEDDED ORIGINAL UI (kept from previous original; large)
-# ============================================================================
-HTML_TEMPLATE = """<!DOCTYPE html>
+# HTML UI
+HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FTC DECODE Scouting System V8.0</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <title>FTC DECODE - Live Scouting</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Inter', sans-serif; background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color: #e2e8f0; min-height: 100vh; padding: 24px; line-height: 1.6; }
-        .container { max-width: 1400px; margin: 0 auto; }
-        .header { background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); padding: 48px 40px; border-radius: 16px; text-align: center; margin-bottom: 32px; box-shadow: 0 20px 60px rgba(59, 130, 246, 0.3); }
-        .header h1 { font-size: 2.5rem; font-weight: 700; margin-bottom: 12px; letter-spacing: -0.02em; }
-        .header p { font-size: 1.125rem; opacity: 0.95; font-weight: 400; }
-        .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.8); z-index: 1000; align-items: center; justify-content: center; }
-        .modal-overlay.show { display: flex; }
-        .modal { background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); padding: 40px; border-radius: 16px; max-width: 600px; width: 90%; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5); border: 1px solid rgba(59, 130, 246, 0.3); }
-        .modal h2 { color: #60a5fa; margin-bottom: 24px; font-size: 1.75rem; font-weight: 700; }
-        .modal p { color: #cbd5e1; margin-bottom: 24px; line-height: 1.6; }
-        .config-section { background: rgba(30, 41, 59, 0.8); backdrop-filter: blur(10px); padding: 28px; border-radius: 12px; margin-bottom: 32px; border: 1px solid rgba(148, 163, 184, 0.1); }
-        .config-section h3 { color: #60a5fa; margin-bottom: 20px; font-size: 1.125rem; font-weight: 600; }
-        .config-group { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        .input-group { margin-bottom: 20px; }
-        .input-group label { display: block; margin-bottom: 8px; color: #cbd5e1; font-weight: 500; font-size: 0.875rem; }
-        .input-group input { width: 100%; padding: 12px 16px; border: 1px solid rgba(148, 163, 184, 0.2); background: rgba(15, 23, 42, 0.6); color: #e2e8f0; border-radius: 8px; font-size: 0.9375rem; transition: all 0.2s; font-family: inherit; }
-        .input-group input:focus { outline: none; border-color: #3b82f6; background: rgba(15, 23, 42, 0.8); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1); }
-        .menu-tabs { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; margin-bottom: 32px; }
-        .menu-btn { padding: 16px 24px; border: 1px solid rgba(148, 163, 184, 0.2); background: rgba(30, 41, 59, 0.6); color: #94a3b8; border-radius: 10px; cursor: pointer; font-weight: 600; font-size: 0.9375rem; transition: all 0.2s; font-family: inherit; }
-        .menu-btn:hover { background: rgba(30, 41, 59, 0.9); border-color: rgba(148, 163, 184, 0.3); transform: translateY(-2px); }
-        .menu-btn.active { background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); border-color: #3b82f6; color: #ffffff; box-shadow: 0 4px 20px rgba(59, 130, 246, 0.4); }
-        .section { display: none; }
-        .section.active { display: block; animation: fadeIn 0.3s ease; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        .input-section { background: rgba(30, 41, 59, 0.6); backdrop-filter: blur(10px); padding: 32px; border-radius: 12px; margin-bottom: 24px; border: 1px solid rgba(148, 163, 184, 0.1); }
-        .input-section h2 { margin-bottom: 24px; color: #60a5fa; font-size: 1.5rem; font-weight: 700; }
-        .button-group { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 24px; }
-        .btn { padding: 14px 28px; border: none; border-radius: 8px; font-size: 0.9375rem; font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: inherit; }
-        .btn-primary { background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); color: white; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3); }
-        .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(59, 130, 246, 0.4); }
-        .btn-secondary { background: rgba(30, 41, 59, 0.8); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.2); }
-        .btn-secondary:hover { background: rgba(30, 41, 59, 1); border-color: rgba(148, 163, 184, 0.3); }
-        .result-section { background: rgba(30, 41, 59, 0.6); backdrop-filter: blur(10px); padding: 32px; border-radius: 12px; border: 1px solid rgba(148, 163, 184, 0.1); display: none; }
-        .result-section.show { display: block; animation: slideUp 0.3s ease; }
-        @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
-        .rankings-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px; }
-        .rank-card { background: rgba(15, 23, 42, 0.6); padding: 24px; border-radius: 12px; border: 1px solid rgba(148, 163, 184, 0.1); position: relative; transition: all 0.2s; }
-        .rank-card:hover { transform: translateY(-4px); border-color: rgba(59, 130, 246, 0.3); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3); }
-        .rank-badge { position: absolute; top: 16px; right: 16px; background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); color: white; padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 0.875rem; }
-        .rank-card h3 { color: #60a5fa; margin-bottom: 16px; font-size: 1.25rem; font-weight: 700; }
-        .rank-stat { margin: 10px 0; color: #cbd5e1; font-size: 0.9375rem; }
-        .rank-stat strong { color: #60a5fa; font-weight: 600; }
-        .strength-tag { display: inline-block; background: rgba(59, 130, 246, 0.2); color: #93c5fd; padding: 6px 12px; border-radius: 16px; margin: 4px 4px 4px 0; font-size: 0.8125rem; font-weight: 500; border: 1px solid rgba(59, 130, 246, 0.3); }
-        .error-msg { background: rgba(239, 68, 68, 0.15); color: #fca5a5; padding: 16px 20px; border-radius: 8px; border-left: 4px solid #ef4444; margin-bottom: 20px; display: none; font-size: 0.9375rem; }
-        .error-msg.show { display: block; animation: fadeIn 0.3s ease; }
-        .success-msg { background: rgba(34, 197, 94, 0.15); color: #86efac; padding: 16px 20px; border-radius: 8px; border-left: 4px solid #22c55e; margin-bottom: 20px; display: none; font-size: 0.9375rem; }
-        .success-msg.show { display: block; animation: fadeIn 0.3s ease; }
-        .strategy-header { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 24px; margin-bottom: 32px; }
-        .team-card { background: rgba(15, 23, 42, 0.6); padding: 24px; border-radius: 12px; border: 1px solid rgba(148, 163, 184, 0.1); text-align: center; }
-        .team-card h3 { color: #60a5fa; margin-bottom: 12px; font-size: 1.125rem; font-weight: 700; }
-        .score-box { background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); color: white; padding: 28px 24px; border-radius: 12px; text-align: center; font-weight: 700; box-shadow: 0 8px 24px rgba(59, 130, 246, 0.4); }
-        .score-box h4 { font-size: 0.875rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.9; margin-bottom: 12px; }
-        .score-value { font-size: 3.5rem; font-weight: 800; line-height: 1; }
-        .phase-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin: 24px 0; }
-        .phase-card { background: rgba(15, 23, 42, 0.6); padding: 28px; border-radius: 12px; border-left: 4px solid #3b82f6; transition: all 0.2s; }
-        .phase-card:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3); }
-        .phase-card h4 { color: #60a5fa; margin-bottom: 16px; font-size: 1.125rem; font-weight: 700; }
-        .phase-stat { display: flex; justify-content: space-between; margin: 12px 0; font-size: 0.9375rem; color: #cbd5e1; }
-        .phase-stat strong { color: #34d399; font-weight: 700; }
-        .risk-list { background: rgba(15, 23, 42, 0.6); padding: 24px; border-radius: 12px; margin-top: 24px; border-left: 4px solid #ef4444; }
-        .risk-list h3 { margin-bottom: 16px; font-size: 1.125rem; font-weight: 700; }
-        .risk-item { color: #cbd5e1; margin: 12px 0; padding: 12px 16px; background: rgba(239, 68, 68, 0.1); border-radius: 8px; border-left: 3px solid #ef4444; font-size: 0.9375rem; }
-        .api-status { background: rgba(15, 23, 42, 0.6); padding: 16px 20px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #f59e0b; }
-        .api-status.connected { border-left-color: #22c55e; }
-        .config-card { background: rgba(15, 23, 42, 0.6); padding: 28px; border-radius: 12px; margin-bottom: 24px; border: 1px solid rgba(148, 163, 184, 0.1); }
-        .config-card h4 { color: #60a5fa; margin-bottom: 16px; font-size: 1.125rem; font-weight: 700; }
-        .config-item { margin-bottom: 16px; }
-        .config-item label { display: block; color: #cbd5e1; margin-bottom: 8px; font-weight: 500; font-size: 0.875rem; }
-        .config-item input { width: 100%; padding: 12px 16px; border: 1px solid rgba(148, 163, 184, 0.2); background: rgba(30, 41, 59, 0.6); color: #e2e8f0; border-radius: 8px; font-size: 0.9375rem; font-family: inherit; }
-        @media (max-width: 768px) {
-            .menu-tabs { grid-template-columns: repeat(2, 1fr); }
-            .strategy-header { grid-template-columns: 1fr; }
-            .config-group { grid-template-columns: 1fr; }
-            .header h1 { font-size: 2rem; }
-        }
+        body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0f; color: #fff; overflow-x: hidden; }
+        .bg-animation { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 0; background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%); opacity: 0.05; }
+        .bg-animation::before { content: ''; position: absolute; top: -50%; left: -50%; width: 200%; height: 200%; background: repeating-linear-gradient(45deg, transparent, transparent 10px, rgba(102, 126, 234, 0.03) 10px, rgba(102, 126, 234, 0.03) 20px); animation: move 20s linear infinite; }
+        @keyframes move { 0% { transform: translate(0, 0); } 100% { transform: translate(50px, 50px); } }
+        .container { position: relative; z-index: 1; max-width: 1800px; margin: 0 auto; padding: 20px; }
+        .top-bar { display: flex; justify-content: space-between; align-items: center; padding: 25px 40px; background: rgba(15, 15, 25, 0.95); backdrop-filter: blur(20px); border-bottom: 1px solid rgba(102, 126, 234, 0.2); margin-bottom: 30px; border-radius: 20px; }
+        .logo { display: flex; align-items: center; gap: 15px; }
+        .logo-icon { width: 50px; height: 50px; background: linear-gradient(135deg, #667eea, #764ba2); border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 1.8em; box-shadow: 0 8px 20px rgba(102, 126, 234, 0.4); }
+        .logo-text h1 { font-size: 1.6em; font-weight: 800; background: linear-gradient(135deg, #667eea, #f093fb); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .logo-text p { font-size: 0.85em; color: #6b7280; margin-top: 2px; }
+        .quick-actions { display: flex; gap: 12px; }
+        .action-btn { padding: 12px 24px; background: rgba(102, 126, 234, 0.1); border: 1px solid rgba(102, 126, 234, 0.3); border-radius: 10px; color: #667eea; font-weight: 600; cursor: pointer; transition: all 0.3s ease; font-size: 0.95em; }
+        .action-btn:hover { background: rgba(102, 126, 234, 0.2); border-color: rgba(102, 126, 234, 0.5); transform: translateY(-2px); }
+        .action-btn.primary { background: linear-gradient(135deg, #667eea, #764ba2); border: none; color: #fff; }
+        .action-btn.primary:hover { box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4); }
+        .setup-panel { background: rgba(15, 15, 25, 0.95); backdrop-filter: blur(20px); border: 1px solid rgba(102, 126, 234, 0.2); border-radius: 20px; padding: 30px; margin-bottom: 30px; }
+        .setup-grid { display: grid; grid-template-columns: 1fr 1fr 0.8fr auto; gap: 15px; align-items: end; }
+        .input-wrapper label { display: block; font-size: 0.85em; color: #9ca3af; margin-bottom: 8px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+        .input-wrapper input { width: 100%; padding: 14px 18px; background: rgba(255, 255, 255, 0.05); border: 2px solid rgba(255, 255, 255, 0.1); border-radius: 12px; color: #fff; font-size: 1em; transition: all 0.3s ease; }
+        .input-wrapper input:focus { outline: none; border-color: #667eea; background: rgba(255, 255, 255, 0.08); box-shadow: 0 0 0 4px rgba(102, 126, 234, 0.1); }
+        .load-btn { padding: 14px 32px; background: linear-gradient(135deg, #667eea, #764ba2); border: none; border-radius: 12px; color: #fff; font-weight: 700; font-size: 1em; cursor: pointer; transition: all 0.3s ease; height: 52px; box-shadow: 0 8px 20px rgba(102, 126, 234, 0.3); }
+        .load-btn:hover { transform: translateY(-2px); box-shadow: 0 12px 30px rgba(102, 126, 234, 0.5); }
+        .load-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin-bottom: 30px; }
+        .stat-card { background: rgba(15, 15, 25, 0.95); backdrop-filter: blur(20px); border: 1px solid rgba(102, 126, 234, 0.2); border-radius: 16px; padding: 25px; position: relative; overflow: hidden; transition: all 0.3s ease; }
+        .stat-card:hover { transform: translateY(-5px); border-color: rgba(102, 126, 234, 0.5); box-shadow: 0 12px 30px rgba(0, 0, 0, 0.3); }
+        .stat-card::before { content: ''; position: absolute; top: 0; left: 0; width: 100%; height: 3px; background: linear-gradient(90deg, #667eea, #764ba2); }
+        .stat-icon { width: 50px; height: 50px; background: rgba(102, 126, 234, 0.1); border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 1.5em; margin-bottom: 15px; }
+        .stat-icon.active { background: linear-gradient(135deg, #667eea, #764ba2); animation: pulse-glow 2s ease infinite; }
+        @keyframes pulse-glow { 0%, 100% { box-shadow: 0 0 20px rgba(102, 126, 234, 0.5); } 50% { box-shadow: 0 0 30px rgba(102, 126, 234, 0.8); } }
+        .stat-label { font-size: 0.85em; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+        .stat-value { font-size: 1.8em; font-weight: 800; background: linear-gradient(135deg, #fff, #e5e7eb); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .main-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 30px; margin-bottom: 30px; }
+        .section-card { background: rgba(15, 15, 25, 0.95); backdrop-filter: blur(20px); border: 1px solid rgba(102, 126, 234, 0.2); border-radius: 20px; padding: 30px; }
+        .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; }
+        .section-title { font-size: 1.5em; font-weight: 700; display: flex; align-items: center; gap: 12px; }
+        .live-indicator { display: flex; align-items: center; gap: 8px; padding: 8px 16px; background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 20px; font-size: 0.85em; font-weight: 600; }
+        .live-dot { width: 8px; height: 8px; background: #ef4444; border-radius: 50%; animation: pulse-live 1.5s ease infinite; }
+        @keyframes pulse-live { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(1.2); } }
+        .match-card { background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 16px; padding: 25px; margin-bottom: 20px; transition: all 0.3s ease; }
+        .match-card:hover { background: rgba(255, 255, 255, 0.05); border-color: rgba(102, 126, 234, 0.3); transform: scale(1.02); }
+        .match-info { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid rgba(255, 255, 255, 0.08); }
+        .match-number { font-size: 1.2em; font-weight: 700; color: #667eea; }
+        .match-time { font-size: 0.9em; color: #6b7280; }
+        .match-content { display: grid; grid-template-columns: 1fr auto 1fr; gap: 25px; align-items: center; }
+        .alliance-box { background: rgba(255, 255, 255, 0.03); border-radius: 12px; padding: 20px; border: 2px solid transparent; transition: all 0.3s ease; }
+        .alliance-box.red { border-color: rgba(239, 68, 68, 0.3); }
+        .alliance-box.blue { border-color: rgba(59, 130, 246, 0.3); }
+        .alliance-box:hover { background: rgba(255, 255, 255, 0.05); }
+        .alliance-label { font-size: 0.8em; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 15px; opacity: 0.6; }
+        .alliance-box.red .alliance-label { color: #ef4444; }
+        .alliance-box.blue .alliance-label { color: #3b82f6; }
+        .team-item { background: rgba(255, 255, 255, 0.05); padding: 12px 15px; border-radius: 8px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; transition: all 0.2s ease; }
+        .team-item:hover { background: rgba(255, 255, 255, 0.08); transform: translateX(5px); }
+        .team-num { font-weight: 700; font-size: 1.1em; }
+        .team-avg { font-size: 0.85em; color: #9ca3af; }
+        .alliance-score { font-size: 3.5em; font-weight: 900; text-align: center; margin-top: 15px; text-shadow: 0 0 30px currentColor; }
+        .alliance-box.red .alliance-score { color: #ef4444; }
+        .alliance-box.blue .alliance-score { color: #3b82f6; }
+        .vs-divider { text-align: center; font-size: 2em; font-weight: 800; color: #4b5563; }
+        .rankings-table { width: 100%; }
+        .rank-row { display: grid; grid-template-columns: 60px 1fr 80px 80px 60px; gap: 15px; align-items: center; padding: 15px; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 12px; margin-bottom: 10px; transition: all 0.3s ease; }
+        .rank-row:hover { background: rgba(255, 255, 255, 0.05); border-color: rgba(102, 126, 234, 0.3); transform: translateX(5px); }
+        .rank-badge { width: 45px; height: 45px; background: linear-gradient(135deg, #667eea, #764ba2); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 1.1em; }
+        .rank-badge.gold { background: linear-gradient(135deg, #fbbf24, #f59e0b); box-shadow: 0 0 20px rgba(251, 191, 36, 0.5); }
+        .rank-badge.silver { background: linear-gradient(135deg, #e5e7eb, #9ca3af); box-shadow: 0 0 20px rgba(229, 231, 235, 0.3); }
+        .rank-badge.bronze { background: linear-gradient(135deg, #fb923c, #f97316); box-shadow: 0 0 20px rgba(249, 115, 22, 0.5); }
+        .team-info { display: flex; flex-direction: column; }
+        .team-name { font-weight: 700; font-size: 1.1em; margin-bottom: 4px; }
+        .team-strengths { display: flex; gap: 6px; flex-wrap: wrap; }
+        .strength-pill { padding: 3px 10px; background: rgba(102, 126, 234, 0.2); border-radius: 12px; font-size: 0.7em; color: #667eea; font-weight: 600; }
+        .score-display { font-size: 1.3em; font-weight: 800; color: #fff; }
+        .consistency-bar { width: 100%; height: 6px; background: rgba(255, 255, 255, 0.1); border-radius: 3px; overflow: hidden; }
+        .consistency-fill { height: 100%; background: linear-gradient(90deg, #667eea, #764ba2); border-radius: 3px; transition: width 0.5s ease; }
+        .trend-icon { font-size: 1.5em; }
+        .loading-state { text-align: center; padding: 60px 20px; color: #6b7280; }
+        .spinner { width: 50px; height: 50px; border: 4px solid rgba(102, 126, 234, 0.2); border-top-color: #667eea; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 20px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .alliance-card { background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 16px; padding: 20px; margin-bottom: 15px; transition: all 0.3s ease; }
+        .alliance-card:hover { background: rgba(255, 255, 255, 0.05); border-color: rgba(102, 126, 234, 0.3); }
+        .alliance-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+        .partner-number { font-size: 1.3em; font-weight: 800; color: #667eea; }
+        .alliance-score-badge { padding: 8px 16px; background: linear-gradient(135deg, #667eea, #764ba2); border-radius: 12px; font-weight: 700; }
+        .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 15px; }
+        .stat-box { text-align: center; padding: 10px; background: rgba(255, 255, 255, 0.03); border-radius: 8px; }
+        .stat-box-label { font-size: 0.7em; color: #9ca3af; text-transform: uppercase; }
+        .stat-box-value { font-size: 1.2em; font-weight: 700; color: #fff; margin-top: 5px; }
+        .strategy-input { display: grid; grid-template-columns: 1fr 1fr auto; gap: 15px; margin-bottom: 30px; }
+        .page { display: none; }
+        .page.active { display: block; }
+        @media (max-width: 1400px) { .main-grid { grid-template-columns: 1fr; } }
+        @media (max-width: 1024px) { .stats-row { grid-template-columns: repeat(2, 1fr); } }
+        @media (max-width: 768px) { .setup-grid { grid-template-columns: 1fr; } .stats-row { grid-template-columns: 1fr; } .match-content { grid-template-columns: 1fr; } .vs-divider { order: -1; } .top-bar { flex-direction: column; gap: 20px; } .quick-actions { width: 100%; justify-content: stretch; } .action-btn { flex: 1; } }
     </style>
 </head>
 <body>
-<div class="modal-overlay" id="init-modal">
-    <div class="modal">
-        <h2>🚀 Initialize Event Data</h2>
-        <p>Enter your FTC event code to automatically load match data from the FIRST Tech Challenge API.</p>
-        
-        <div class="input-group">
-            <label>Event Code (e.g., USAKAKM1)</label>
-            <input type="text" id="init-event-code" placeholder="Enter FTC event code">
-        </div>
-        
-        <div class="input-group">
-            <label>Your Team Number</label>
-            <input type="text" id="init-team-number" placeholder="Enter your team number">
-        </div>
-        
-        <div class="input-group">
-            <label>Season</label>
-            <input type="number" id="init-season" value="2025" placeholder="2025">
+    <div class="bg-animation"></div>
+    <div class="container">
+        <div class="top-bar">
+            <div class="logo">
+                <div class="logo-icon">🤖</div>
+                <div class="logo-text"><h1>DECODE Scouting</h1><p>Neural Network Analysis System</p></div>
+            </div>
+            <div class="quick-actions">
+                <button class="action-btn" onclick="showPage('home')">🏠 Home</button>
+                <button class="action-btn" onclick="showPage('alliance')">🤝 Alliance</button>
+                <button class="action-btn" onclick="showPage('strategy')">📊 Strategy</button>
+                <button class="action-btn primary" onclick="refreshData()">🔄 Refresh</button>
+            </div>
         </div>
         
-        <div class="success-msg" id="init-success"></div>
-        <div class="error-msg" id="init-error"></div>
-        
-        <div class="button-group">
-            <button class="btn btn-primary" onclick="initializeEvent()">Load Event Data</button>
-            <button class="btn btn-secondary" onclick="document.getElementById('init-modal').classList.remove('show')">Cancel</button>
-        </div>
-    </div>
-</div>
-
-<div class="container" id="main-content">
-    <div class="header">
-        <h1>FTC DECODE Scouting System V8.0</h1>
-        <p>Professional Analytics & Strategic Intelligence Platform • Server Edition</p>
-    </div>
-    
-    <div class="api-status" id="api-status">
-        <strong>⚠️ Not Connected:</strong> Click "Load New Event" to connect to FTC API
-    </div>
-    
-    <div class="config-section">
-        <h3>Event Configuration</h3>
-        <div class="config-group">
-            <div class="input-group">
-                <label>Event Code</label>
-                <input type="text" id="global-event-code" placeholder="Enter event code" readonly>
-            </div>
-            <div class="input-group">
-                <label>Your Team Number</label>
-                <input type="text" id="global-team-number" placeholder="Enter your team number" readonly>
-            </div>
-        </div>
-        <button class="btn btn-primary" style="margin-top:16px;width:100%" onclick="showInitModal()">Load New Event</button>
-    </div>
-    
-    <div class="menu-tabs">
-        <button class="menu-btn active" onclick="switchSection('rankings')">Rankings</button>
-        <button class="menu-btn" onclick="switchSection('analysis')">Analysis</button>
-        <button class="menu-btn" onclick="switchSection('alliance')">Alliance</button>
-        <button class="menu-btn" onclick="switchSection('strategy')">Strategy</button>
-        <button class="menu-btn" onclick="switchSection('tuning')">Tuning</button>
-    </div>
-    
-    <div id="rankings" class="section active">
-        <div class="input-section">
-            <h2>Team Rankings</h2>
-            <p style="color:#94a3b8;margin-bottom:20px">View ranked performance of all teams at your event</p>
-            <div class="button-group">
-                <button class="btn btn-primary" onclick="generateRankings()">Load Rankings</button>
-                <button class="btn btn-secondary" onclick="clearRankings()">Clear</button>
-            </div>
-        </div>
-        <div class="error-msg" id="error-rank"></div>
-        <div class="result-section" id="rankings-result">
-            <div id="rankings-grid" class="rankings-grid"></div>
-        </div>
-    </div>
-    
-    <div id="analysis" class="section">
-        <div class="input-section">
-            <h2>Team Analysis</h2>
-            <p style="color:#94a3b8;margin-bottom:20px">Deep dive into individual team performance patterns</p>
-            <div class="input-group">
-                <label>Team Number</label>
-                <input type="text" id="analysis-team" placeholder="Leave blank for your team">
-            </div>
-            <div class="button-group">
-                <button class="btn btn-primary" onclick="analyzeTeam()">Analyze</button>
-                <button class="btn btn-secondary" onclick="clearAnalysis()">Clear</button>
-            </div>
-        </div>
-        <div class="error-msg" id="error-analysis"></div>
-        <div class="result-section" id="analysis-result">
-            <div id="analysis-content"></div>
-        </div>
-    </div>
-    
-    <div id="alliance" class="section">
-        <div class="input-section">
-            <h2>Alliance Finder</h2>
-            <p style="color:#94a3b8;margin-bottom:20px">Discover optimal alliance partners based on comprehensive compatibility analysis</p>
-            <div class="input-group">
-                <label>Your Team</label>
-                <input type="text" id="your-team-alliance" placeholder="Leave blank for default">
-            </div>
-            <div class="button-group">
-                <button class="btn btn-primary" onclick="findBestAlliance()">Find Best Alliance</button>
-                <button class="btn btn-secondary" onclick="clearAllianceFinder()">Clear</button>
-            </div>
-        </div>
-        <div class="error-msg" id="error-alliance"></div>
-        <div class="result-section" id="alliance-result">
-            <div id="alliance-content"></div>
-        </div>
-    </div>
-    
-    <div id="strategy" class="section">
-        <div class="input-section">
-            <h2>Strategy Generator</h2>
-            <p style="color:#94a3b8;margin-bottom:20px">Generate detailed match strategy for your alliance</p>
-            <div class="input-group">
-                <label>Partner Team Number</label>
-                <input type="text" id="partner-team" placeholder="Enter partner team number">
-            </div>
-            <div class="button-group">
-                <button class="btn btn-primary" onclick="generateStrategy()">Generate Strategy</button>
-                <button class="btn btn-secondary" onclick="clearStrategy()">Clear</button>
-            </div>
-        </div>
-        <div class="error-msg" id="error-strat"></div>
-        <div class="result-section" id="strategy-result">
-            <div class="strategy-header">
-                <div class="team-card">
-                    <h3 id="team1-name">Team 1</h3>
-                    <div id="team1-strengths"></div>
-                </div>
-                <div class="score-box">
-                    <h4>Compatibility Score</h4>
-                    <div class="score-value" id="score">0</div>
-                </div>
-                <div class="team-card">
-                    <h3 id="team2-name">Team 2</h3>
-                    <div id="team2-strengths"></div>
+        <div id="homePage" class="page active">
+            <div class="setup-panel">
+                <div class="setup-grid">
+                    <div class="input-wrapper"><label>Event Code</label><input type="text" id="eventCode" placeholder="USILCA1"></div>
+                    <div class="input-wrapper"><label>Team Number</label><input type="number" id="teamNumber" placeholder="11506"></div>
+                    <div class="input-wrapper"><label>Season</label><input type="number" id="season" value="2025"></div>
+                    <button class="load-btn" onclick="loadEvent()" id="loadBtn">🚀 Load Event</button>
                 </div>
             </div>
-            <div class="phase-cards" id="phase-cards"></div>
-            <div class="risk-list" id="risks"></div>
-        </div>
-    </div>
-    
-    <div id="tuning" class="section">
-        <div class="input-section">
-            <h2>Scoring Configuration Tuning</h2>
-            <p style="color:#94a3b8;margin-bottom:24px">Adjust the weights and thresholds to customize how teams are evaluated.</p>
-            <div class="success-msg" id="success-tuning"></div>
-            <div class="error-msg" id="error-tuning"></div>
-            
-            <div class="config-editor" id="config-editor"></div>
-            
-            <div class="button-group">
-                <button class="btn btn-primary" onclick="saveConfig()">Save Configuration</button>
-                <button class="btn btn-secondary" onclick="loadConfig()">Reset to Saved</button>
+            <div class="stats-row">
+                <div class="stat-card"><div class="stat-icon" id="eventIcon">📡</div><div class="stat-label">Event Status</div><div class="stat-value" id="eventStatus">Not Loaded</div></div>
+                <div class="stat-card"><div class="stat-icon" id="aiIcon">🤖</div><div class="stat-label">AI Model</div><div class="stat-value" id="aiStatus">Standby</div></div>
+                <div class="stat-card"><div class="stat-icon" id="matchIcon">🏁</div><div class="stat-label">Matches</div><div class="stat-value" id="matchCount">0</div></div>
+                <div class="stat-card"><div class="stat-icon" id="teamsIcon">👥</div><div class="stat-label">Teams</div><div class="stat-value" id="teamCount">0</div></div>
             </div>
-        </div>
-    </div>
-</div>
-
-<script>
-let currentConfig = null;
-let eventData = {
-    eventCode: null,
-    teamNumber: null,
-    season: 2025
-};
-
-function showInitModal() {
-    document.getElementById('init-modal').classList.add('show');
-}
-
-async function initializeEvent() {
-    const eventCode = document.getElementById('init-event-code').value.trim();
-    const teamNumber = document.getElementById('init-team-number').value.trim();
-    const season = document.getElementById('init-season').value || 2025;
-    const errorEl = document.getElementById('init-error');
-    const successEl = document.getElementById('init-success');
-    
-    errorEl.classList.remove('show');
-    successEl.classList.remove('show');
-    
-    if (!eventCode || !teamNumber) {
-        errorEl.textContent = 'Please enter both event code and team number';
-        errorEl.classList.add('show');
-        return;
-    }
-    
-    try {
-        const resp = await fetch('/api/ftc-event-init', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-                event_code: eventCode,
-                team_number: teamNumber,
-                season: parseInt(season)
-            })
-        });
-        
-        const data = await resp.json();
-        
-        if (data.error) {
-            errorEl.textContent = data.error;
-            errorEl.classList.add('show');
-            return;
-        }
-        
-        successEl.textContent = `✓ ${data.message}! Loaded ${data.match_count} matches for ${data.teams_with_data} teams.`;
-        successEl.classList.add('show');
-        
-        eventData.eventCode = eventCode;
-        eventData.teamNumber = teamNumber;
-        eventData.season = parseInt(season);
-        
-        document.getElementById('global-event-code').value = eventCode;
-        document.getElementById('global-team-number').value = teamNumber;
-        
-        const statusEl = document.getElementById('api-status');
-        statusEl.className = 'api-status connected';
-        statusEl.innerHTML = `<strong>✓ Connected:</strong> ${eventCode} • ${data.teams_with_data} teams with match data`;
-        
-        setTimeout(() => {
-            document.getElementById('init-modal').classList.remove('show');
-        }, 2000);
-        
-    } catch (e) {
-        errorEl.textContent = 'Error: ' + e.message;
-        errorEl.classList.add('show');
-    }
-}
-
-function switchSection(section) {
-    document.querySelectorAll(".section").forEach(s => s.classList.remove("active"));
-    document.querySelectorAll(".menu-btn").forEach(b => b.classList.remove("active"));
-    document.getElementById(section).classList.add("active");
-    event.target.classList.add("active");
-    if (section === 'tuning' && !currentConfig) loadConfig();
-}
-
-async function loadConfig() {
-    try {
-        const resp = await fetch("/api/config");
-        const config = await resp.json();
-        currentConfig = config;
-        displayConfig(config);
-    } catch (e) {
-        console.error("Error loading config:", e);
-    }
-}
-
-function displayConfig(config) {
-    const editor = document.getElementById("config-editor");
-    editor.innerHTML = `
-        <div class="config-card">
-            <h4>⚖️ Scoring Weights</h4>
-            <p style="color:#94a3b8;margin-bottom:16px;font-size:0.875rem">These weights determine how much each phase contributes to alliance compatibility scores.</p>
-            <div class="config-item"><label>Auto Phase Weight</label><input type="number" step="0.1" min="0" max="1" id="auto_weight" value="${config.scoring_weights.auto_weight}"></div>
-            <div class="config-item"><label>Teleop Phase Weight</label><input type="number" step="0.1" min="0" max="1" id="teleop_weight" value="${config.scoring_weights.teleop_weight}"></div>
-            <div class="config-item"><label>Endgame Phase Weight</label><input type="number" step="0.1" min="0" max="1" id="endgame_weight" value="${config.scoring_weights.endgame_weight}"></div>
-        </div>
-        <div class="config-card">
-            <h4>🎯 Performance Thresholds</h4>
-            <p style="color:#94a3b8;margin-bottom:16px;font-size:0.875rem">These values define what constitutes "strong" performance.</p>
-            <div class="config-item"><label>Strong Auto Score</label><input type="number" step="1" min="0" id="strong_auto" value="${config.thresholds.strong_auto}"></div>
-            <div class="config-item"><label>Fast Cycle Time</label><input type="number" step="1" min="0" id="fast_cycle" value="${config.thresholds.fast_cycle}"></div>
-            <div class="config-item"><label>High Hanging %</label><input type="number" step="5" min="0" max="100" id="high_hanging" value="${config.thresholds.high_hanging}"></div>
-            <div class="config-item"><label>High Scoring</label><input type="number" step="10" min="0" id="high_scoring" value="${config.thresholds.high_scoring}"></div>
-        </div>
-    `;
-}
-
-async function saveConfig() {
-    const errEl = document.getElementById("error-tuning");
-    const succEl = document.getElementById("success-tuning");
-    errEl.classList.remove("show");
-    succEl.classList.remove("show");
-    
-    try {
-        const newConfig = {
-            scoring_weights: {
-                auto_weight: parseFloat(document.getElementById("auto_weight").value),
-                teleop_weight: parseFloat(document.getElementById("teleop_weight").value),
-                endgame_weight: parseFloat(document.getElementById("endgame_weight").value),
-                hanging_success_weight: 0.2,
-                reliability_multiplier: 3,
-                cycle_time_factor: 50
-            },
-            thresholds: {
-                strong_auto: parseInt(document.getElementById("strong_auto").value),
-                fast_cycle: parseInt(document.getElementById("fast_cycle").value),
-                high_hanging: parseInt(document.getElementById("high_hanging").value),
-                high_reliability: 4,
-                high_scoring: parseInt(document.getElementById("high_scoring").value),
-                consistency_high: 70,
-                consistency_medium: 40
-            },
-            alliance: {
-                min_combined_score: 120,
-                consistency_threshold: 70
-            }
-        };
-        
-        const resp = await fetch("/api/config", {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify(newConfig)
-        });
-        
-        const result = await resp.json();
-        if (result.error) {
-            errEl.textContent = result.error;
-            errEl.classList.add("show");
-        } else {
-            succEl.textContent = "✓ Configuration saved successfully!";
-            succEl.classList.add("show");
-            currentConfig = newConfig;
-            setTimeout(() => succEl.classList.remove("show"), 5000);
-        }
-    } catch (e) {
-        errEl.textContent = "Error: " + e.message;
-        errEl.classList.add("show");
-    }
-}
-
-async function generateRankings() {
-    const errEl = document.getElementById("error-rank");
-    const resEl = document.getElementById("rankings-result");
-    errEl.classList.remove("show");
-    resEl.classList.remove("show");
-    
-    if (!eventData.eventCode) {
-        errEl.textContent = "Please load an event first";
-        errEl.classList.add("show");
-        return;
-    }
-    
-    try {
-        const resp = await fetch('/api/ftc-rankings', {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                event_code: eventData.eventCode,
-                season: eventData.season
-            })
-        });
-        
-        const data = await resp.json();
-        if (data.error) {
-            errEl.textContent = data.error;
-            errEl.classList.add("show");
-            return;
-        }
-        
-        document.getElementById("rankings-grid").innerHTML = data.rankings.map((t, i) => `
-            <div class="rank-card">
-                <div class="rank-badge">#${i + 1}</div>
-                <h3>Team ${t.team_number}</h3>
-                <div class="rank-stat"><strong>Total:</strong> ${t.score.toFixed(1)} pts</div>
-                <div class="rank-stat"><strong>Auto:</strong> ${t.auto.toFixed(1)} pts</div>
-                <div class="rank-stat"><strong>Teleop:</strong> ${t.teleop.toFixed(1)} pts</div>
-                <div class="rank-stat"><strong>Endgame:</strong> ${t.endgame.toFixed(1)} pts</div>
-                <div class="rank-stat"><strong>Consistency:</strong> ${t.consistency.toFixed(0)}%</div>
-                <div class="rank-stat"><strong>Trend:</strong> ${t.trend}</div>
-                <div style="margin-top:12px">${t.strengths.map(s => `<span class="strength-tag">${s}</span>`).join("")}</div>
-            </div>
-        `).join("");
-        resEl.classList.add("show");
-    } catch (e) {
-        errEl.textContent = "Error: " + e.message;
-        errEl.classList.add("show");
-    }
-}
-
-async function analyzeTeam() {
-    const teamNum = document.getElementById("analysis-team").value || eventData.teamNumber;
-    const errEl = document.getElementById("error-analysis");
-    const resEl = document.getElementById("analysis-result");
-    errEl.classList.remove("show");
-    resEl.classList.remove("show");
-    
-    if (!eventData.eventCode || !teamNum) {
-        errEl.textContent = "Please load an event and enter a team number";
-        errEl.classList.add("show");
-        return;
-    }
-    
-    try {
-        const resp = await fetch('/api/ftc-analysis', {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                event_code: eventData.eventCode,
-                team_number: teamNum,
-                season: eventData.season
-            })
-        });
-        
-        const data = await resp.json();
-        if (data.error) {
-            errEl.textContent = data.error;
-            errEl.classList.add("show");
-            return;
-        }
-        
-        const a = data.analysis;
-        document.getElementById("analysis-content").innerHTML = `
-            <div style="background:rgba(15,23,42,0.6);padding:32px;border-radius:12px">
-                <h2 style="color:#60a5fa;margin-bottom:24px;font-size:1.5rem">Team ${data.team_number}</h2>
-                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:20px;margin-bottom:32px">
-                    <div style="background:rgba(30,41,59,0.6);padding:24px;border-radius:12px;border-left:4px solid #3b82f6">
-                        <p style="color:#94a3b8;font-weight:600;font-size:0.875rem">Consistency</p>
-                        <p style="font-size:2.5rem;margin:12px 0;font-weight:700;color:#60a5fa">${a.consistency.toFixed(0)}%</p>
-                        <p style="color:#cbd5e1">${a.reliability}</p>
+            <div class="main-grid">
+                <div class="section-card">
+                    <div class="section-header">
+                        <div class="section-title"><span>🔴</span>Live Match Feed</div>
+                        <div class="live-indicator"><div class="live-dot"></div><span>LIVE</span></div>
                     </div>
-                    <div style="background:rgba(30,41,59,0.6);padding:24px;border-radius:12px;border-left:4px solid #3b82f6">
-                        <p style="color:#94a3b8;font-weight:600;font-size:0.875rem">Trend</p>
-                        <p style="font-size:2.5rem;margin:12px 0;font-weight:700;color:#60a5fa">${a.trend}</p>
-                    </div>
-                    <div style="background:rgba(30,41,59,0.6);padding:24px;border-radius:12px;border-left:4px solid #3b82f6">
-                        <p style="color:#94a3b8;font-weight:600;font-size:0.875rem">Peak Score</p>
-                        <p style="font-size:2.5rem;margin:12px 0;font-weight:700;color:#60a5fa">${a.peak}</p>
-                    </div>
-                    <div style="background:rgba(30,41,59,0.6);padding:24px;border-radius:12px;border-left:4px solid #3b82f6">
-                        <p style="color:#94a3b8;font-weight:600;font-size:0.875rem">Style</p>
-                        <p style="font-size:1.25rem;margin:12px 0;font-weight:600;color:#60a5fa">${a.behavioral}</p>
-                    </div>
+                    <div id="matchesFeed"><div class="loading-state"><div class="spinner"></div><p>Load an event to see live match data</p></div></div>
                 </div>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px">
-                    <div style="background:rgba(30,41,59,0.6);padding:24px;border-radius:12px;border-left:4px solid #3b82f6">
-                        <h3 style="color:#60a5fa;margin-bottom:12px">Averages</h3>
-                        <p style="color:#cbd5e1">Auto: <strong>${data.team_stats.auto.toFixed(1)}</strong></p>
-                        <p style="color:#cbd5e1">Teleop: <strong>${data.team_stats.teleop.toFixed(1)}</strong></p>
-                        <p style="color:#cbd5e1">Endgame: <strong>${data.team_stats.endgame.toFixed(1)}</strong></p>
-                        <p style="color:#cbd5e1">Total: <strong>${data.team_stats.total.toFixed(1)}</strong></p>
-                    </div>
-                    <div style="background:rgba(30,41,59,0.6);padding:24px;border-radius:12px;border-left:4px solid #ef4444">
-                        <h3 style="color:#ef4444;margin-bottom:12px">Risks & Notes</h3>
-                        <p style="color:#cbd5e1">Hanging success: <strong>${data.team_stats.hanging.toFixed(0)}%</strong></p>
-                        <p style="color:#cbd5e1">Reliability: <strong>${data.team_stats.reliability.toFixed(1)}</strong></p>
-                        <p style="color:#cbd5e1">Penalties total: <strong>${data.team_stats.penalties}</strong></p>
-                    </div>
+                <div class="section-card">
+                    <div class="section-header"><div class="section-title"><span>🏆</span>Rankings</div></div>
+                    <div id="rankingsContent"><div class="loading-state"><p>Rankings will appear here</p></div></div>
                 </div>
             </div>
-        `;
-        resEl.classList.add("show");
-    } catch (e) {
-        errEl.textContent = "Error: " + e.message;
-        errEl.classList.add("show");
-    }
-}
+        </div>
 
-async function findBestAlliance() {
-    const team = document.getElementById('your-team-alliance').value || eventData.teamNumber;
-    const errEl = document.getElementById("error-alliance");
-    const resEl = document.getElementById("alliance-result");
-    errEl.classList.remove("show");
-    resEl.classList.remove("show");
-    if (!eventData.eventCode || !team) {
-        errEl.textContent = "Please load an event and provide your team number";
-        errEl.classList.add("show");
-        return;
-    }
-    try {
-        const resp = await fetch('/api/ftc-alliance', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ team_number: team })
-        });
-        const data = await resp.json();
-        if (data.error) {
-            errEl.textContent = data.error;
-            errEl.classList.add("show");
-            return;
-        }
-        document.getElementById('alliance-content').innerHTML = data.alliances.map(a => `
-            <div style="background:rgba(15,23,42,0.6);padding:16px;border-radius:8px;margin-bottom:12px">
-                <strong>Partner: ${a.partner_team} — Score: ${a.alliance_score}</strong>
-                <div style="margin-top:8px">${a.compatibility_reasons.map(r => `<div style="color:#cbd5e1">${r}</div>`).join('')}</div>
+        <div id="alliancePage" class="page">
+            <div class="section-card">
+                <div class="section-header">
+                    <div class="section-title"><span>🤝</span>Alliance Selection</div>
+                </div>
+                <div class="input-wrapper" style="max-width: 300px; margin-bottom: 30px;">
+                    <label>Your Team Number</label>
+                    <input type="number" id="allianceTeamNumber" placeholder="11506">
+                    <button class="load-btn" onclick="findAlliances()" style="margin-top: 15px; width: 100%;">🔍 Find Best Partners</button>
+                </div>
+                <div id="allianceResults"><div class="loading-state"><p>Enter your team number to find the best alliance partners</p></div></div>
             </div>
-        `).join('');
-        resEl.classList.add('show');
-    } catch (e) {
-        errEl.textContent = "Error: " + e.message;
-        errEl.classList.add("show");
-    }
-}
+        </div>
 
-async function generateStrategy() {
-    const partner = document.getElementById('partner-team').value;
-    const our = document.getElementById('global-team-number').value || '';
-    const errEl = document.getElementById('error-strat');
-    const resEl = document.getElementById('strategy-result');
-    errEl.classList.remove("show");
-    resEl.classList.remove("show");
-    if (!our || !partner) {
-        errEl.textContent = "Please ensure both your team and partner team numbers are provided";
-        errEl.classList.add("show");
-        return;
-    }
-    try {
-        const resp = await fetch('/api/ftc-strategy', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ team1: our, team2: partner })
-        });
-        const data = await resp.json();
-        if (data.error) {
-            errEl.textContent = data.error;
-            errEl.classList.add("show");
-            return;
+        <div id="strategyPage" class="page">
+            <div class="section-card">
+                <div class="section-header">
+                    <div class="section-title"><span>📊</span>Match Strategy</div>
+                </div>
+                <div class="strategy-input">
+                    <div class="input-wrapper">
+                        <label>Team 1</label>
+                        <input type="number" id="stratTeam1" placeholder="11506">
+                    </div>
+                    <div class="input-wrapper">
+                        <label>Team 2</label>
+                        <input type="number" id="stratTeam2" placeholder="12345">
+                    </div>
+                    <button class="load-btn" onclick="generateStrategy()" style="height: 52px; margin-top: 24px;">🎯 Generate Strategy</button>
+                </div>
+                <div id="strategyResults"><div class="loading-state"><p>Enter two team numbers to generate an alliance strategy</p></div></div>
+            </div>
+        </div>
+    </div>
+    <script>
+        const API=window.location.origin;let autoRefreshInterval=null;
+        
+        function showPage(pageName) {
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+            document.getElementById(pageName + 'Page').classList.add('active');
         }
-        document.getElementById('team1-name').innerText = data.team1_name;
-        document.getElementById('team2-name').innerText = data.team2_name;
-        document.getElementById('team1-strengths').innerHTML = data.team1_strengths.map(s => `<div class="strength-tag">${s}</div>`).join('');
-        document.getElementById('team2-strengths').innerHTML = data.team2_strengths.map(s => `<div class="strength-tag">${s}</div>`).join('');
-        document.getElementById('score').innerText = data.score;
-        document.getElementById('phase-cards').innerHTML = `
-            <div class="phase-card"><h4>Auto</h4><div class="phase-stat"><strong>${data.strategy_data.auto_phase}</strong><span>points</span></div></div>
-            <div class="phase-card"><h4>Teleop</h4><div class="phase-stat"><strong>${data.strategy_data.teleop_phase}</strong><span>points</span></div></div>
-            <div class="phase-card"><h4>Endgame</h4><div class="phase-stat"><strong>${data.strategy_data.endgame_phase}</strong><span>points</span></div></div>
-        `;
-        document.getElementById('risks').innerHTML = `<h3>Risks</h3>${data.strategy_data.risks.map(r => `<div class="risk-item">${r}</div>`).join('')}`;
-        resEl.classList.add('show');
-    } catch (e) {
-        errEl.textContent = "Error: " + e.message;
-        errEl.classList.add("show");
-    }
-}
-
-// Helpers for UI clearing
-function clearRankings() { document.getElementById('rankings-grid').innerHTML = ''; document.getElementById('rankings-result').classList.remove('show'); }
-function clearAnalysis() { document.getElementById('analysis-content').innerHTML = ''; document.getElementById('analysis-result').classList.remove('show'); }
-function clearAllianceFinder() { document.getElementById('alliance-content').innerHTML = ''; document.getElementById('alliance-result').classList.remove('show'); }
-function clearStrategy() { document.getElementById('phase-cards').innerHTML = ''; document.getElementById('risks').innerHTML = ''; document.getElementById('strategy-result').classList.remove('show'); }
-
-</script>
+        
+        async function loadEvent(){const code=document.getElementById('eventCode').value.trim();const team=document.getElementById('teamNumber').value.trim();const season=document.getElementById('season').value.trim();if(!code||!team){alert('Please enter event code and team number');return}const btn=document.getElementById('loadBtn');btn.disabled=true;btn.innerHTML='⏳ Loading...';try{const res=await fetch(`${API}/api/ftc-event-init`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({event_code:code,team_number:team,season:parseInt(season)})});const data=await res.json();if(res.ok){updateStats(data);await refreshData();btn.innerHTML='✅ Loaded';if(autoRefreshInterval)clearInterval(autoRefreshInterval);autoRefreshInterval=setInterval(refreshData,30000)}else{alert('Error: '+data.error);btn.innerHTML='🚀 Load Event'}}catch(e){alert('Error: '+e.message);btn.innerHTML='🚀 Load Event'}finally{btn.disabled=false}}
+        
+        function updateStats(data){document.getElementById('eventIcon').classList.add('active');document.getElementById('eventStatus').textContent=data.event_code;document.getElementById('matchIcon').classList.add('active');document.getElementById('matchCount').textContent=data.match_count;document.getElementById('teamsIcon').classList.add('active');document.getElementById('teamCount').textContent=data.teams_with_data;if(data.ai_trained){document.getElementById('aiIcon').classList.add('active');document.getElementById('aiStatus').textContent='Trained'}}
+        
+        async function refreshData(){await Promise.all([loadMatches(),loadRankings()])}
+        
+        async function loadMatches(){try{const res=await fetch(`${API}/api/ftc-rankings`);const data=await res.json();if(res.ok&&data.rankings.length>0){displayMatches(data.rankings)}}catch(e){console.error('Failed to load matches:',e)}}
+        
+        function displayMatches(rankings){const container=document.getElementById('matchesFeed');let html='';for(let i=0;i<Math.min(4,Math.floor(rankings.length/2));i++){const red1=rankings[i*2]||rankings[0];const red2=rankings[i*2+1]||rankings[1];const blue1=rankings[(i*2+2)%rankings.length];const blue2=rankings[(i*2+3)%rankings.length];const redScore=Math.round(red1.score+red2.score);const blueScore=Math.round(blue1.score+blue2.score);html+=`<div class="match-card"><div class="match-info"><div class="match-number">Qualification ${i+1}</div><div class="match-time">Recently Completed</div></div><div class="match-content"><div class="alliance-box red"><div class="alliance-label">Red Alliance</div><div class="team-item"><span class="team-num">${red1.team_number}</span><span class="team-avg">${red1.score.toFixed(0)} avg</span></div><div class="team-item"><span class="team-num">${red2.team_number}</span><span class="team-avg">${red2.score.toFixed(0)} avg</span></div><div class="alliance-score">${redScore}</div></div><div class="vs-divider">VS</div><div class="alliance-box blue"><div class="alliance-label">Blue Alliance</div><div class="team-item"><span class="team-num">${blue1.team_number}</span><span class="team-avg">${blue1.score.toFixed(0)} avg</span></div><div class="team-item"><span class="team-num">${blue2.team_number}</span><span class="team-avg">${blue2.score.toFixed(0)} avg</span></div><div class="alliance-score">${blueScore}</div></div></div></div>`}container.innerHTML=html}
+        
+        async function loadRankings(){try{const res=await fetch(`${API}/api/ftc-rankings`);const data=await res.json();if(res.ok){displayRankings(data.rankings.slice(0,8))}}catch(e){console.error('Failed to load rankings:',e)}}
+        
+        function displayRankings(rankings){const container=document.getElementById('rankingsContent');let html='<div class="rankings-table">';rankings.forEach((team,i)=>{let badgeClass='';if(i===0)badgeClass='gold';else if(i===1)badgeClass='silver';else if(i===2)badgeClass='bronze';const strengthsHTML=team.strengths.slice(0,2).map(s=>`<span class="strength-pill">${s}</span>`).join('');html+=`<div class="rank-row"><div class="rank-badge ${badgeClass}">${i+1}</div><div class="team-info"><div class="team-name">${team.team_number}</div><div class="team-strengths">${strengthsHTML}</div></div><div class="score-display">${team.score.toFixed(1)}</div><div><div class="consistency-bar"><div class="consistency-fill" style="width:${team.consistency}%"></div></div></div><div class="trend-icon">${team.trend}</div></div>`});html+='</div>';container.innerHTML=html}
+        
+        async function findAlliances(){const team=document.getElementById('allianceTeamNumber').value.trim();if(!team){alert('Please enter your team number');return}try{const res=await fetch(`${API}/api/ftc-alliance`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({team_number:team})});const data=await res.json();if(res.ok){displayAlliances(data)}else{alert('Error: '+data.error)}}catch(e){alert('Error: '+e.message)}}
+        
+        function displayAlliances(data){const container=document.getElementById('allianceResults');let html='';data.alliances.forEach((alliance,i)=>{const aiInfo=alliance.ai_expected_score?`<p style="color:#9ca3af;font-size:0.9em;margin-top:10px;">AI Prediction: ${alliance.ai_expected_score.toFixed(0)} pts • Win: ${alliance.ai_win_probability.toFixed(1)}%</p>`:'';html+=`<div class="alliance-card"><div class="alliance-header"><div class="partner-number">Team ${alliance.partner_team}</div><div class="alliance-score-badge">${alliance.alliance_score.toFixed(1)}% Match</div></div><div class="stat-grid"><div class="stat-box"><div class="stat-box-label">Auto</div><div class="stat-box-value">${alliance.partner_stats.auto.toFixed(0)}</div></div><div class="stat-box"><div class="stat-box-label">Teleop</div><div class="stat-box-value">${alliance.partner_stats.teleop.toFixed(0)}</div></div><div class="stat-box"><div class="stat-box-label">Endgame</div><div class="stat-box-value">${alliance.partner_stats.endgame.toFixed(0)}</div></div><div class="stat-box"><div class="stat-box-label">Consistency</div><div class="stat-box-value">${alliance.partner_stats.consistency.toFixed(0)}%</div></div></div>${aiInfo}</div>`});container.innerHTML=html}
+        
+        async function generateStrategy(){const t1=document.getElementById('stratTeam1').value.trim();const t2=document.getElementById('stratTeam2').value.trim();if(!t1||!t2){alert('Please enter both team numbers');return}try{const res=await fetch(`${API}/api/ftc-strategy`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({team1:t1,team2:t2})});const data=await res.json();if(res.ok){displayStrategy(data)}else{alert('Error: '+data.error)}}catch(e){alert('Error: '+e.message)}}
+        
+        function displayStrategy(data){const container=document.getElementById('strategyResults');const aiInfo=data.ai_enabled?`<div style="background:rgba(102,126,234,0.1);padding:20px;border-radius:12px;margin-bottom:20px;"><h3 style="color:#667eea;margin-bottom:10px;">🤖 AI Prediction</h3><p style="font-size:1.5em;font-weight:700;">Expected Score: ${data.ai_expected_score.toFixed(0)} points</p><p style="font-size:1.3em;margin-top:10px;">Win Probability: ${data.ai_win_probability.toFixed(1)}%</p></div>`:'';html=`<div style="background:rgba(255,255,255,0.02);padding:30px;border-radius:16px;"><h2 style="margin-bottom:20px;">Alliance Strategy: Team ${data.team1_num} + Team ${data.team2_num}</h2>${aiInfo}<div class="stat-grid" style="margin-bottom:30px;"><div class="stat-box"><div class="stat-box-label">Auto Phase</div><div class="stat-box-value">${data.strategy_data.auto_phase}</div></div><div class="stat-box"><div class="stat-box-label">Teleop Phase</div><div class="stat-box-value">${data.strategy_data.teleop_phase}</div></div><div class="stat-box"><div class="stat-box-label">Endgame Phase</div><div class="stat-box-value">${data.strategy_data.endgame_phase}</div></div><div class="stat-box"><div class="stat-box-label">Total Estimate</div><div class="stat-box-value">${data.strategy_data.estimated_total}</div></div></div><div style="margin-top:30px;"><h3 style="margin-bottom:15px;">Team Strengths</h3><div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;"><div><h4 style="color:#667eea;margin-bottom:10px;">Team ${data.team1_num}</h4><div class="team-strengths">${data.team1_strengths.map(s=>`<span class="strength-pill">${s}</span>`).join('')}</div></div><div><h4 style="color:#667eea;margin-bottom:10px;">Team ${data.team2_num}</h4><div class="team-strengths">${data.team2_strengths.map(s=>`<span class="strength-pill">${s}</span>`).join('')}</div></div></div></div>${data.strategy_data.risks.length>0?`<div style="margin-top:30px;padding:20px;background:rgba(239,68,68,0.1);border-radius:12px;"><h3 style="color:#ef4444;margin-bottom:10px;">⚠️ Risk Factors</h3>${data.strategy_data.risks.map(r=>`<p style="margin-top:5px;">• ${r}</p>`).join('')}</div>`:''}</div>`;container.innerHTML=html}
+    </script>
 </body>
-</html>
-"""
-
-# ============================================================================
-# FLASK API ROUTES
-# ============================================================================
+</html>"""
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/api/config', methods=['GET', 'POST'])
-def api_config():
-    global CONFIG
-    if request.method == 'GET':
-        return jsonify(CONFIG)
-    data = request.get_json() or {}
-    try:
-        CONFIG = data
-        with open('config.json', 'w') as f:
-            json.dump(CONFIG, f, indent=4)
-        return jsonify({'message': 'Config saved'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    return HTML
 
 @app.route('/api/ftc-event-init', methods=['POST'])
-def api_event_init():
-    data = request.get_json() or {}
-    event_code = data.get('event_code')
-    team_number = data.get('team_number')
-    season = int(data.get('season', 2025))
-    if not event_code or not team_number:
-        return jsonify({'error': 'event_code and team_number required'}), 400
+def ftc_event_init():
+    try:
+        data = request.json
+        event_code = data.get('event_code', '').strip()
+        team_number = data.get('team_number', '').strip()
+        season = data.get('season', 2025)
+        if not event_code or not team_number:
+            return jsonify({'error': 'Event code and team number required'}), 400
+        matches = fetch_event_matches(event_code, season)
+        if matches is None:
+            return jsonify({'error': f'Could not fetch event data for {event_code}'}), 404
+        if len(matches) == 0:
+            return jsonify({'error': f'No matches found for event {event_code}'}), 404
+        processed_entries = process_ftc_match_data(matches)
+        if not processed_entries:
+            return jsonify({'error': 'Failed to process match data'}), 500
+        teams_dict = process_teams(processed_entries)
+        if not teams_dict:
+            return jsonify({'error': 'Failed to process team statistics'}), 500
+        EVENT_STORE['event_code'] = event_code
+        EVENT_STORE['team_number'] = team_number
+        EVENT_STORE['season'] = season
+        EVENT_STORE['raw_matches'] = matches
+        EVENT_STORE['teams_processed'] = teams_dict
+        ai_trained = AI_MODEL.train(teams_dict, matches)
+        return jsonify({
+            'message': 'Event data loaded successfully',
+            'event_code': event_code,
+            'season': season,
+            'match_count': len(matches),
+            'teams_with_data': len(teams_dict),
+            'ai_trained': ai_trained,
+            'ai_training_samples': AI_MODEL.training_samples if ai_trained else 0
+        })
+    except Exception as e:
+        return jsonify({'error': 'Internal server error'}), 500
 
-    matches = fetch_event_matches(event_code, season=season)
-    if matches is None:
-        return jsonify({'error': 'Could not fetch matches for that event (check event code or API)'}), 400
-
-    processed_entries = process_ftc_match_data(matches)
-    teams_processed = process_teams(processed_entries)
-
-    EVENT_STORE['event_code'] = event_code
-    EVENT_STORE['season'] = season
-    EVENT_STORE['team_number'] = str(team_number)
-    EVENT_STORE['raw_matches'] = matches
-    EVENT_STORE['processed_entries'] = processed_entries
-    EVENT_STORE['teams_processed'] = teams_processed
-
-    return jsonify({
-        'message': 'Event loaded',
-        'match_count': len(matches),
-        'teams_with_data': len(teams_processed)
-    })
-
-@app.route('/api/ftc-rankings', methods=['POST'])
-def api_rankings():
-    teams = EVENT_STORE.get('teams_processed', {})
-    if not teams:
-        return jsonify({'error': 'No event loaded'}), 400
-    ranked = get_ranking_list(teams)
-    return jsonify({'rankings': ranked})
+@app.route('/api/ftc-rankings', methods=['GET'])
+def ftc_rankings():
+    try:
+        if not EVENT_STORE['teams_processed']:
+            return jsonify({'error': 'No event data loaded'}), 400
+        rankings = get_ranking_list(EVENT_STORE['teams_processed'])
+        return jsonify({'rankings': rankings, 'event_code': EVENT_STORE['event_code'], 'team_count': len(rankings)})
+    except Exception as e:
+        return jsonify({'error': 'Failed to generate rankings'}), 500
 
 @app.route('/api/ftc-analysis', methods=['POST'])
-def api_analysis():
-    data = request.get_json() or {}
-    team_number = str(data.get('team_number') or EVENT_STORE.get('team_number') or '').strip()
-    teams = EVENT_STORE.get('teams_processed', {})
-    if not teams:
-        return jsonify({'error': 'No event loaded'}), 400
-    if not team_number:
-        return jsonify({'error': 'team_number required'}), 400
-    team = teams.get(team_number)
-    if not team:
-        return jsonify({'error': f'Team {team_number} not found in loaded event'}), 404
-    return jsonify({
-        'team_number': team_number,
-        'analysis': team.get('pattern_analysis', {}),
-        'team_stats': {
-            'auto': team.get('auto_score_avg', 0),
-            'teleop': team.get('teleop_score_avg', 0),
-            'endgame': team.get('endgame_score_avg', 0),
-            'total': team.get('total_score_avg', 0),
-            'hanging': team.get('hanging_success', 0),
-            'reliability': team.get('reliability', 0),
-            'penalties': team.get('penalties', 0)
-        }
-    })
+def ftc_analysis():
+    try:
+        data = request.json
+        team_number = str(data.get('team_number', '')).strip()
+        if not team_number:
+            return jsonify({'error': 'Team number required'}), 400
+        teams_dict = EVENT_STORE['teams_processed']
+        if not teams_dict:
+            return jsonify({'error': 'No event data loaded'}), 400
+        if team_number not in teams_dict:
+            return jsonify({'error': f'Team {team_number} not found'}), 404
+        team = teams_dict[team_number]
+        return jsonify({
+            'team_number': team_number,
+            'analysis': team['pattern_analysis'],
+            'team_stats': {
+                'auto': team['auto_score_avg'],
+                'auto_std': team['auto_score_std'],
+                'teleop': team['teleop_score_avg'],
+                'teleop_std': team['teleop_score_std'],
+                'endgame': team['endgame_score_avg'],
+                'endgame_std': team['endgame_score_std'],
+                'total': team['total_score_avg'],
+                'total_std': team['total_score_std'],
+                'penalties': team['penalties']
+            }
+        })
+    except Exception as e:
+        return jsonify({'error': 'Failed to analyze team'}), 500
 
 @app.route('/api/ftc-alliance', methods=['POST'])
-def api_alliance():
-    data = request.get_json() or {}
-    team_number = str(data.get('team_number') or EVENT_STORE.get('team_number') or '').strip()
-    teams = EVENT_STORE.get('teams_processed', {})
-    if not teams:
-        return jsonify({'error': 'No event loaded'}), 400
-    if not team_number:
-        return jsonify({'error': 'team_number required'}), 400
-    alliances = find_best_alliances(team_number, teams)
-    if alliances is None:
-        return jsonify({'error': f'Team {team_number} not found'}), 404
-    return jsonify({'alliances': alliances})
+def ftc_alliance():
+    try:
+        data = request.json
+        team_number = str(data.get('team_number', '')).strip()
+        if not team_number:
+            return jsonify({'error': 'Team number required'}), 400
+        teams_dict = EVENT_STORE['teams_processed']
+        if not teams_dict:
+            return jsonify({'error': 'No event data loaded'}), 400
+        alliances = find_best_alliances(team_number, teams_dict)
+        if alliances is None:
+            return jsonify({'error': f'Team {team_number} not found'}), 404
+        return jsonify({'your_team': team_number, 'alliances': alliances, 'ai_enabled': AI_MODEL.is_trained})
+    except Exception as e:
+        return jsonify({'error': 'Failed to find alliances'}), 500
 
 @app.route('/api/ftc-strategy', methods=['POST'])
-def api_strategy():
-    data = request.get_json() or {}
-    t1 = str(data.get('team1') or '')
-    t2 = str(data.get('team2') or '')
-    teams = EVENT_STORE.get('teams_processed', {})
-    if not teams:
-        return jsonify({'error': 'No event loaded'}), 400
-    if not t1 or not t2:
-        return jsonify({'error': 'team1 and team2 required'}), 400
-    result = generate_ai_strategy(t1, t2, teams)
-    return jsonify(result)
+def ftc_strategy():
+    try:
+        data = request.json
+        team1 = str(data.get('team1', '')).strip()
+        team2 = str(data.get('team2', '')).strip()
+        if not team1 or not team2:
+            return jsonify({'error': 'Both team numbers required'}), 400
+        teams_dict = EVENT_STORE['teams_processed']
+        if not teams_dict:
+            return jsonify({'error': 'No event data loaded'}), 400
+        strategy = generate_ai_strategy(team1, team2, teams_dict)
+        if 'error' in strategy:
+            return jsonify(strategy), 404
+        return jsonify(strategy)
+    except Exception as e:
+        return jsonify({'error': 'Failed to generate strategy'}), 500
 
-# ============================================================================
-# RUN SERVER
-# ============================================================================
+@app.route('/health')
+def health():
+    return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat(), 'event_loaded': EVENT_STORE['event_code'] is not None, 'ai_trained': AI_MODEL.is_trained})
+
 if __name__ == '__main__':
-    print("\n" + "="*80)
-    print("FTC DECODE SCOUTING SYSTEM V8.0 - CLEAN (API field names, no 'lift')")
-    print("Starting server on http://localhost:5000")
-    print("Ensure dependencies installed: pip install flask requests numpy")
-    print("="*80 + "\n")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    print("\n" + "="*70)
+    print("🤖 FTC DECODE Scouting System by Team 11506")
+    print("="*70)
+    print(f"📡 Server: http://127.0.0.1:{port}")
+    print(f"🔧 API Configured: {bool(FTC_API_USERNAME and FTC_API_KEY)}")
+    print(f"🧠 Neural Network: Ready")
+    print("="*70 + "\n")
+    app.run(host='127.0.0.1', port=port, debug=True)
