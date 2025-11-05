@@ -22,9 +22,8 @@ app.config['SECRET_KEY'] = os.urandom(24)
 
 # API Config
 FTC_API_BASE = 'https://ftc-api.firstinspires.org/v2.0'
-FTC_API_USERNAME = os.environ.get('FTC_API_USERNAME', 'harry')
-FTC_API_KEY = os.environ.get('FTC_API_KEY', '4B5F8571-EB4C-4F87-9DC1-0F3C5AFAF010')
-
+FTC_API_USERNAME = os.environ.get('FTC_API_USERNAME', 'YOUR_USERNAME_HERE')
+FTC_API_KEY = os.environ.get('FTC_API_KEY', 'YOUR_API_KEY_HERE')
 # Neural Network
 class FTCNeuralNetwork:
     def __init__(self):
